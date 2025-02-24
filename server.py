@@ -1,25 +1,53 @@
+import os
 import time
 import uuid
 import jwt
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, status 
 from fastapi.responses import HTMLResponse, RedirectResponse
+import hmac
+import hashlib
+import ipaddress
+from httpx import AsyncClient
 
 app = FastAPI()
 
-GITHUB_APP_NAME = "..."
-GITHUB_APP_ID = "..."
-GITHUB_PRIVATE_KEY = "..."
-GH_CLIENT_ID = "..."
-GH_CLIENT_SECRET = "..."
-JWT_SECRET = "..."
+GITHUB_APP_NAME = os.getenv("GITHUB_APP_NAME")
+GITHUB_APP_ID = os.getenv("GITHUB_APP_ID")
+GITHUB_PRIVATE_KEY = os.getenv("GITHUB_PRIVATE_KEY")
+GH_CLIENT_ID = os.getenv("GH_CLIENT_ID")
+GH_CLIENT_SECRET = os.getenv("GH_CLIENT_SECRET")
+JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_ALGORITHM = "HS256"
-
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 INSTALLATIONS_DB = {}
 
 # Fake Account
 ACCOUNT_ID = uuid.uuid4()
+
+
+def verify_signature(payload_body, secret_token, signature_header)->None:
+    """Verify that the payload was sent from GitHub by validating SHA256.
+
+    Raise and return 403 if not authorized.
+
+    Args:
+        payload_body: original request body to verify (request.body())
+        secret_token: GitHub app webhook token (WEBHOOK_SECRET)
+        signature_header: header received from GitHub (x-hub-signature-256)
+    """
+    if not signature_header:
+        raise HTTPException(
+            status_code=403, detail="x-hub-signature-256 header is missing!"
+        )
+    hash_object = hmac.new(
+        secret_token.encode("utf-8"), msg=payload_body, digestmod=hashlib.sha256
+    )
+    expected_signature = "sha256=" + hash_object.hexdigest()
+    if not hmac.compare_digest(expected_signature, signature_header):
+        raise HTTPException(status_code=403, detail="Request signatures didn't match!")
+
 
 
 def generate_state_token(account_id: str) -> str:
@@ -200,6 +228,25 @@ async def github_callback(request: Request):
     # 4) Redirect to a success page
     return RedirectResponse(url="/setup")
 
+@app.post("/webhook")
+async def webhook_handler(request: Request,x_github_event: str):
+    # Verify the signature
+    signature = request.headers.get("X-Hub-Signature-256")
+    if not signature:
+        raise HTTPException(status_code=401, detail="Signature not found")
+
+    data = await request.body()
+    if not WEBHOOK_SECRET:
+       raise HTTPException(status_code=401, detail="WEBHOOK_SECRET not configured")
+
+    verify_signature(data, WEBHOOK_SECRET, signature)
+
+    # Process the webhook payload
+    payload = await request.json()
+    print(f"Received webhook event: {payload['action']}")
+    # Add your logic here to handle specific events
+
+    return {"status": "success"}
 
 @app.get("/setup", response_class=HTMLResponse)
 def setup_page():
@@ -324,8 +371,9 @@ def generate_app_jwt() -> str:
         "exp": exp,
         "iss": GITHUB_APP_ID,  # your GitHub App ID
     }
-
-    encoded_jwt = jwt.encode(payload, GITHUB_PRIVATE_KEY, algorithm="RS256")
+    with open(GITHUB_PRIVATE_KEY, "rb") as key_file:    
+        private_key = key_file.read()
+    encoded_jwt = jwt.encode(payload, private_key, algorithm="RS256")
     return encoded_jwt
 
 
@@ -443,6 +491,25 @@ async def list_files_in_repo(owner: str, repo: str, installation_id: int):
     """
 
     return HTMLResponse(html)
+
+async def gate_by_github_ip(request: Request):
+        try:
+            src_ip = ipaddress.ip_address(request.client.host)
+        except ValueError:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "Could not hook sender ip address"
+            )
+        async with AsyncClient() as client:
+            allowlist = await client.get("https://api.github.com/meta")
+        for valid_ip in allowlist.json()["hooks"]:
+            if src_ip in ipaddress.ip_network(valid_ip):
+                return
+        else:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "Not a GitHub hooks ip address"
+            )
+
+
 
 
 if __name__ == "__main__":
